@@ -37,10 +37,9 @@ except ImportError:
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
-# Not strictly needed for slash-only commands, but harmless to enable if
-# you plan to bolt on prefix commands later (matches BOB_BOT's setup).
-intents.message_content = True
-
+# message_content is a privileged intent (must be enabled in the Discord
+# Developer Portal) and isn't needed here since every command is a slash
+# command — the bot never reads raw message text.
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -64,6 +63,10 @@ async def main():
         await bot.load_extension("weao_cog")
         await bot.start(TOKEN)
 
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
 
 if __name__ == "__main__":
     import asyncio
