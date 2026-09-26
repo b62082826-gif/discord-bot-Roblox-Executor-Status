@@ -5,6 +5,12 @@ Standalone Discord bot for WEAO (weao.xyz) exploit status tracking.
 Run this file directly to start the bot — it loads the WeaoCog from
 weao_cog.py and syncs its slash commands on startup.
 
+Also starts a Flask keep-alive server (keep_alive.py) so a free Render
+Web Service has an open port to keep it from being marked unhealthy.
+Render's free tier still spins down after 15 minutes with no inbound
+HTTP traffic, so pair this with an external uptime pinger (e.g.
+UptimeRobot or cron-job.org) hitting your Render URL every 5-10 minutes.
+
 Setup:
     1. pip install -r requirements.txt
     2. Set your bot token as an environment variable:
@@ -25,6 +31,8 @@ import os
 
 import discord
 from discord.ext import commands
+
+from keep_alive import keep_alive
 
 # Load a .env file if python-dotenv is installed and one exists; optional,
 # env vars set directly (Render, Railway, etc.) work without it.
@@ -59,14 +67,11 @@ async def main():
             "DISCORD_TOKEN is not set. Set it as an environment variable "
             "or put it in a .env file next to bot.py."
         )
+    keep_alive()  # start the Flask heartbeat server in the background
     async with bot:
         await bot.load_extension("weao_cog")
         await bot.start(TOKEN)
 
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
 
 if __name__ == "__main__":
     import asyncio
