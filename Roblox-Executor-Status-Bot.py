@@ -2,9 +2,12 @@
 weao_cog.py
 
 Discord.py cog that exposes the WEAO (weao.xyz) exploit-status API
-as slash commands: exploit status (all / single), version info
+as slash commands: exploit status (all / single), Roblox version info
 (current / past / future), and an auto-notification loop that posts
-to a configured channel whenever an exploit's status changes.
+to a configured channel whenever an exploit's detected/updated state
+changes.
+
+Schema reference: WEAO API docs (Exploits + Roblox versions pages).
 
 Usage:
     from weao_cog import WeaoCog
@@ -33,13 +36,38 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "weao_notify_config.json")
 POLL_INTERVAL_MINUTES = 7  # anywhere in the 5-10 min range you mentioned
 
 
+def exploit_state_label(item: dict) -> str:
+    """Combine updateStatus + detected into one human label."""
+    if not item.get("updateStatus"):
+        return "Outdated"
+    if item.get("detected"):
+        return "Updated but Detected"
+    return "Updated & Undetected"
+
+
+def exploit_state_emoji(label: str) -> str:
+    return {
+        "Outdated": "🔴",
+        "Updated but Detected": "🟠",
+        "Updated & Undetected": "🟢",
+    }.get(label, "⚪")
+
+
+def exploit_state_color(label: str) -> discord.Color:
+    return {
+        "Outdated": discord.Color.red(),
+        "Updated but Detected": discord.Color.orange(),
+        "Updated & Undetected": discord.Color.green(),
+    }.get(label, discord.Color.greyple())
+
+
 class WeaoCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.session: aiohttp.ClientSession | None = None
         self.notify_channels: dict[str, int] = self._load_config()
-        # last known working/not-working state per exploit name, e.g. {"solara": True}
-        self.last_state: dict[str, bool] = {}
+        # last known state label per exploit title, e.g. {"Potassium": "Updated & Undetected"}
+        self.last_state: dict[str, str] = {}
         self._seeded = False  # avoid a notification storm on first poll after startup
 
     async def cog_load(self):
@@ -67,9 +95,17 @@ class WeaoCog(commands.Cog):
             json.dump(self.notify_channels, f, ensure_ascii=False, indent=2)
 
     async def _get(self, path: str):
-        """GET a WEAO endpoint, returning (data, error)."""
+        """GET a WEAO endpoint, returning (data, error).
+
+        WEAO returns 429 with a JSON body ({"error": ..., "rateLimitInfo": {...}})
+        when you're rate limited, so that case gets its own message.
+        """
         try:
             async with self.session.get(f"{WEAO_BASE}{path}") as resp:
+                if resp.status == 429:
+                    body = await resp.json()
+                    wait = body.get("rateLimitInfo", {}).get("remainingTime", "a bit")
+                    return None, f"Rate limited by WEAO, try again in ~{wait}s"
                 if resp.status != 200:
                     return None, f"Upstream returned status {resp.status}"
                 return await resp.json(), None
@@ -87,12 +123,12 @@ class WeaoCog(commands.Cog):
             return
 
         embed = discord.Embed(title="Exploit Status", color=discord.Color.blurple())
-        # data is expected to be a list of exploit dicts; adjust keys to match the real schema
         for item in data[:25]:  # embeds cap at 25 fields
-            name = item.get("title") or item.get("name", "Unknown")
-            working = item.get("working")
-            status = "🟢 Working" if working else "🔴 Not working"
-            embed.add_field(name=name, value=status, inline=True)
+            name = item.get("title", "Unknown")
+            label = exploit_state_label(item)
+            emoji = exploit_state_emoji(label)
+            free_tag = "Free" if item.get("free") else "Paid"
+            embed.add_field(name=name, value=f"{emoji} {label} · {free_tag}", inline=True)
 
         await interaction.followup.send(embed=embed)
 
@@ -107,13 +143,25 @@ class WeaoCog(commands.Cog):
             await interaction.followup.send(f"Couldn't fetch status for **{name}**: {err}")
             return
 
-        working = data.get("working")
-        status = "🟢 Working" if working else "🔴 Not working"
-        version = data.get("version", "n/a")
+        label = exploit_state_label(data)
+        emoji = exploit_state_emoji(label)
 
-        embed = discord.Embed(title=name, color=discord.Color.green() if working else discord.Color.red())
-        embed.add_field(name="Status", value=status, inline=True)
-        embed.add_field(name="Version", value=version, inline=True)
+        embed = discord.Embed(
+            title=data.get("title", name),
+            color=exploit_state_color(label),
+        )
+        embed.add_field(name="Status", value=f"{emoji} {label}", inline=True)
+        embed.add_field(name="Version", value=data.get("version", "n/a"), inline=True)
+        embed.add_field(name="Platform", value=data.get("platform", "n/a"), inline=True)
+        embed.add_field(name="Cost", value=data.get("cost", "Free" if data.get("free") else "Paid"), inline=True)
+        embed.add_field(name="UNC Support", value="Yes" if data.get("uncStatus") else "No", inline=True)
+        embed.add_field(name="Last Updated", value=data.get("updatedDate", "n/a"), inline=True)
+
+        if data.get("websitelink"):
+            embed.add_field(name="Website", value=data["websitelink"], inline=False)
+        if data.get("purchaselink") and not data.get("free"):
+            embed.add_field(name="Purchase", value=data["purchaselink"], inline=False)
+
         await interaction.followup.send(embed=embed)
 
     # ---------- /version <which> ----------
@@ -132,12 +180,23 @@ class WeaoCog(commands.Cog):
             await interaction.followup.send(f"Couldn't fetch {which.value} version info: {err}")
             return
 
-        embed = discord.Embed(title=f"Roblox — {which.value.capitalize()} Version", color=discord.Color.blurple())
-        if isinstance(data, dict):
-            for k, v in data.items():
-                embed.add_field(name=str(k), value=str(v), inline=True)
-        else:
-            embed.description = str(data)
+        embed = discord.Embed(
+            title=f"Roblox — {which.value.capitalize()} Version",
+            color=discord.Color.blurple(),
+        )
+        # Android/iOS are only present on the "current" endpoint per the docs
+        for platform, ver_key, date_key in (
+            ("Windows", "Windows", "WindowsDate"),
+            ("Mac", "Mac", "MacDate"),
+            ("Android", "Android", "AndroidDate"),
+            ("iOS", "iOS", "iOSDate"),
+        ):
+            if ver_key in data:
+                embed.add_field(
+                    name=platform,
+                    value=f"{data[ver_key]}\n{data.get(date_key, '')}",
+                    inline=True,
+                )
 
         await interaction.followup.send(embed=embed)
 
@@ -168,20 +227,20 @@ class WeaoCog(commands.Cog):
     async def poll_status(self):
         data, err = await self._get("/status/exploits")
         if err or not isinstance(data, list):
-            return  # skip this tick silently; next poll will retry
+            return  # skip this tick silently (including rate limits); next poll will retry
 
-        current_state: dict[str, bool] = {}
-        changes: list[tuple[str, bool]] = []
+        current_state: dict[str, str] = {}
+        changes: list[tuple[str, str, str]] = []  # (name, old_label, new_label)
 
         for item in data:
-            name = item.get("title") or item.get("name")
-            working = bool(item.get("working"))
+            name = item.get("title")
             if not name:
                 continue
-            current_state[name] = working
+            label = exploit_state_label(item)
+            current_state[name] = label
 
-            if self._seeded and name in self.last_state and self.last_state[name] != working:
-                changes.append((name, working))
+            if self._seeded and name in self.last_state and self.last_state[name] != label:
+                changes.append((name, self.last_state[name], label))
 
         self.last_state = current_state
         self._seeded = True  # first successful poll just seeds state, no alerts fired
@@ -190,10 +249,11 @@ class WeaoCog(commands.Cog):
             return
 
         embed = discord.Embed(title="Exploit Status Changes", color=discord.Color.orange())
-        for name, working in changes:
+        for name, old_label, new_label in changes:
+            emoji = exploit_state_emoji(new_label)
             embed.add_field(
                 name=name,
-                value="🟢 Back online" if working else "🔴 Now offline",
+                value=f"{old_label} → {emoji} {new_label}",
                 inline=False,
             )
 
