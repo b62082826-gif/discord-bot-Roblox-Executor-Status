@@ -17,12 +17,16 @@ Requires: discord.py >= 2.0, aiohttp (already a discord.py dependency)
 """
 
 import json
+import logging
 import os
+import urllib.parse
 
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+
+log = logging.getLogger("weao_cog")
 
 WEAO_BASE = "https://weao.xyz/api"
 HEADERS = {
@@ -34,6 +38,7 @@ HEADERS = {
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "weao_notify_config.json")
 
 POLL_INTERVAL_MINUTES = 7  # anywhere in the 5-10 min range you mentioned
+REQUEST_TIMEOUT_SECONDS = 10
 
 
 def exploit_state_label(item: dict) -> str:
@@ -69,9 +74,11 @@ class WeaoCog(commands.Cog):
         # last known state label per exploit title, e.g. {"Potassium": "Updated & Undetected"}
         self.last_state: dict[str, str] = {}
         self._seeded = False  # avoid a notification storm on first poll after startup
+        self._poll_fail_streak = 0
 
     async def cog_load(self):
-        self.session = aiohttp.ClientSession(headers=HEADERS)
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+        self.session = aiohttp.ClientSession(headers=HEADERS, timeout=timeout)
         self.poll_status.start()
 
     async def cog_unload(self):
@@ -86,30 +93,52 @@ class WeaoCog(commands.Cog):
             try:
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError) as e:
+                log.warning("Failed to load %s: %s", CONFIG_PATH, e)
                 return {}
         return {}
 
     def _save_config(self):
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(self.notify_channels, f, ensure_ascii=False, indent=2)
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.notify_channels, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            log.error("Failed to save %s: %s", CONFIG_PATH, e)
 
     async def _get(self, path: str):
         """GET a WEAO endpoint, returning (data, error).
 
         WEAO returns 429 with a JSON body ({"error": ..., "rateLimitInfo": {...}})
-        when you're rate limited, so that case gets its own message.
+        when you're rate limited, so that case gets its own message. Also treats
+        a 200 response whose body itself contains an "error" key (e.g. an
+        unknown exploit name) as an error rather than passing it through.
         """
         try:
             async with self.session.get(f"{WEAO_BASE}{path}") as resp:
                 if resp.status == 429:
-                    body = await resp.json()
-                    wait = body.get("rateLimitInfo", {}).get("remainingTime", "a bit")
+                    try:
+                        body = await resp.json()
+                        wait = body.get("rateLimitInfo", {}).get("remainingTime", "a bit")
+                    except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                        wait = "a bit"
                     return None, f"Rate limited by WEAO, try again in ~{wait}s"
+
                 if resp.status != 200:
                     return None, f"Upstream returned status {resp.status}"
-                return await resp.json(), None
+
+                try:
+                    data = await resp.json()
+                except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                    return None, "Upstream returned an unreadable response"
+
+                if isinstance(data, dict) and data.get("error"):
+                    return None, str(data["error"])
+
+                return data, None
+        except aiohttp.ClientError as e:
+            return None, f"Network error: {e}"
         except Exception as e:
+            log.exception("Unexpected error fetching %s", path)
             return None, str(e)
 
     # ---------- /exploits ----------
@@ -121,6 +150,9 @@ class WeaoCog(commands.Cog):
         if err:
             await interaction.followup.send(f"Couldn't fetch exploit list: {err}")
             return
+        if not isinstance(data, list) or not data:
+            await interaction.followup.send("No exploit data available right now.")
+            return
 
         embed = discord.Embed(title="Exploit Status", color=discord.Color.blurple())
         for item in data[:25]:  # embeds cap at 25 fields
@@ -130,6 +162,9 @@ class WeaoCog(commands.Cog):
             free_tag = "Free" if item.get("free") else "Paid"
             embed.add_field(name=name, value=f"{emoji} {label} · {free_tag}", inline=True)
 
+        if len(data) > 25:
+            embed.set_footer(text=f"Showing 25 of {len(data)} tracked exploits")
+
         await interaction.followup.send(embed=embed)
 
     # ---------- /exploit <name> ----------
@@ -138,9 +173,13 @@ class WeaoCog(commands.Cog):
     @app_commands.describe(name="Exact exploit name")
     async def exploit(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer()
-        data, err = await self._get(f"/status/exploits/{name}")
+        safe_name = urllib.parse.quote(name, safe="")
+        data, err = await self._get(f"/status/exploits/{safe_name}")
         if err:
             await interaction.followup.send(f"Couldn't fetch status for **{name}**: {err}")
+            return
+        if not isinstance(data, dict):
+            await interaction.followup.send(f"No data found for **{name}**.")
             return
 
         label = exploit_state_label(data)
@@ -179,12 +218,16 @@ class WeaoCog(commands.Cog):
         if err:
             await interaction.followup.send(f"Couldn't fetch {which.value} version info: {err}")
             return
+        if not isinstance(data, dict):
+            await interaction.followup.send(f"No {which.value} version data available.")
+            return
 
         embed = discord.Embed(
             title=f"Roblox — {which.value.capitalize()} Version",
             color=discord.Color.blurple(),
         )
         # Android/iOS are only present on the "current" endpoint per the docs
+        found_any = False
         for platform, ver_key, date_key in (
             ("Windows", "Windows", "WindowsDate"),
             ("Mac", "Mac", "MacDate"),
@@ -192,11 +235,16 @@ class WeaoCog(commands.Cog):
             ("iOS", "iOS", "iOSDate"),
         ):
             if ver_key in data:
+                found_any = True
                 embed.add_field(
                     name=platform,
                     value=f"{data[ver_key]}\n{data.get(date_key, '')}",
                     inline=True,
                 )
+
+        if not found_any:
+            await interaction.followup.send(f"No recognizable version fields for **{which.value}**.")
+            return
 
         await interaction.followup.send(embed=embed)
 
@@ -205,6 +253,9 @@ class WeaoCog(commands.Cog):
     @app_commands.command(name="setnotifychannel", description="Set this channel for exploit status change alerts")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def setnotifychannel(self, interaction: discord.Interaction, channel: discord.TextChannel | None = None):
+        if interaction.guild_id is None:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return
         target = channel or interaction.channel
         self.notify_channels[str(interaction.guild_id)] = target.id
         self._save_config()
@@ -219,7 +270,11 @@ class WeaoCog(commands.Cog):
                 "You need the **Manage Server** permission to set the notify channel.", ephemeral=True
             )
         else:
-            raise error
+            log.exception("Unhandled error in setnotifychannel", exc_info=error)
+            if interaction.response.is_done():
+                await interaction.followup.send("Something went wrong running that command.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Something went wrong running that command.", ephemeral=True)
 
     # ---------- background poll loop ----------
 
@@ -227,8 +282,17 @@ class WeaoCog(commands.Cog):
     async def poll_status(self):
         data, err = await self._get("/status/exploits")
         if err or not isinstance(data, list):
-            return  # skip this tick silently (including rate limits); next poll will retry
+            self._poll_fail_streak += 1
+            if self._poll_fail_streak in (1, 5, 20) or self._poll_fail_streak % 50 == 0:
+                # Log occasionally instead of on every failed tick, so a prolonged
+                # outage doesn't spam the logs, but persistent failures are still visible.
+                log.warning(
+                    "poll_status failed (%s consecutive failures): %s",
+                    self._poll_fail_streak, err or "unexpected response shape",
+                )
+            return  # skip this tick silently to Discord; next poll will retry
 
+        self._poll_fail_streak = 0
         current_state: dict[str, str] = {}
         changes: list[tuple[str, str, str]] = []  # (name, old_label, new_label)
 
@@ -257,17 +321,34 @@ class WeaoCog(commands.Cog):
                 inline=False,
             )
 
+        stale_guilds = []
         for guild_id, channel_id in self.notify_channels.items():
             channel = self.bot.get_channel(channel_id)
-            if channel:
-                try:
-                    await channel.send(embed=embed)
-                except discord.HTTPException:
-                    pass  # e.g. missing permissions in that channel; skip and continue
+            if channel is None:
+                continue
+            try:
+                await channel.send(embed=embed)
+            except discord.Forbidden:
+                log.warning("Missing permission to send in channel %s (guild %s)", channel_id, guild_id)
+            except discord.HTTPException as e:
+                log.warning("Failed to send alert in channel %s (guild %s): %s", channel_id, guild_id, e)
+
+        if stale_guilds:
+            for gid in stale_guilds:
+                self.notify_channels.pop(gid, None)
+            self._save_config()
 
     @poll_status.before_loop
     async def before_poll_status(self):
         await self.bot.wait_until_ready()
+
+    @poll_status.error
+    async def poll_status_error(self, error: BaseException):
+        # tasks.loop stops the loop entirely if the wrapped coroutine raises
+        # uncaught, so log it and restart rather than silently going dark.
+        log.exception("poll_status crashed, restarting loop", exc_info=error)
+        if not self.poll_status.is_running():
+            self.poll_status.restart()
 
 
 async def setup(bot: commands.Bot):
