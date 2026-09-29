@@ -1,30 +1,31 @@
 """
 weao_cog.py
 
-Discord.py cog สำหรับ WEAO exploit-status API
-  - /exploits            รายการสถานะทั้งหมด
+Discord.py cog สำหรับ WEAO exploit-status API (docs: https://docs.weao.xyz)
+  - /exploits            รายการสถานะทั้งหมด (จัดกลุ่มตามแพลตฟอร์ม, ซ่อนตัวที่ hidden เหมือนหน้าเว็บ)
   - /exploit <name>      สถานะตัวเดียว (มี autocomplete)
   - /version <which>     เวอร์ชัน Roblox (current / past / future)
   - /setnotifychannel    ตั้งห้องแจ้งเตือนเมื่อสถานะเปลี่ยน
   - /clearnotifychannel  ปิดการแจ้งเตือนของเซิร์ฟเวอร์นี้
 
-จุดเด่น
-  - เรียก weao.xyz ก่อน แล้ว fallback ไปพร็อกซีอัตโนมัติเมื่อโดน 429 / เน็ตล่ม / 5xx
-  - จำว่า primary ใช้ไม่ได้ชั่วคราว (circuit breaker) ไม่ยิงซ้ำรัว ๆ
-  - cache ผลลัพธ์สั้น ๆ ลดโหลด + กัน rate limit
-  - ข้อมูลจากพร็อกซี (HTTP ไม่เข้ารหัส) ถูก sanitize: ลิงก์ต้องเป็น https,
-    escape markdown/mention, ตัดความยาว
-  - poll loop ไม่ตายเงียบ, แจ้งเตือนแบ่ง embed ถ้าเปลี่ยนเยอะ, ล้าง config ห้องที่ถูกลบ
+ลำดับ source (ตามเอกสาร WEAO: "เข้าถึงได้ทุกโดเมนโดยไม่จำกัด")
+  1. weao.xyz                      (primary)
+  2. whatexpsare.online            (โดเมนหลักอีกตัว, https)
+  3. พร็อกซี DevFaded (HTTP)       (ท้ายสุด เพราะไม่เข้ารหัส → sanitize ข้อมูลเสมอ)
+แต่ละ source มี circuit breaker แยกกัน (พักเมื่อโดน 429 / 5xx / เน็ตล่ม)
 
 Env (ไม่บังคับ)
-  WEAO_PRIMARY_BASE  default https://weao.xyz/api
-  WEAO_PROXY_BASE    default http://farts.fadedis.xyz:25551/api  (ตั้งเป็นค่าว่างเพื่อปิด fallback)
+  WEAO_PRIMARY_BASE   default https://weao.xyz/api
+  WEAO_MIRROR_BASES   คั่นด้วย comma, default https://whatexpsare.online/api  (ตั้งเป็นค่าว่างเพื่อปิด)
+                      โดเมนอื่นที่เอกสารระบุ: https://weao.gg/api, https://whatexploitsaretra.sh/api
+  WEAO_PROXY_BASE     default http://farts.fadedis.xyz:25505/api  (ตั้งเป็นค่าว่างเพื่อปิด)
 
 Requires: discord.py >= 2.0, Python >= 3.10
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ import tempfile
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import aiohttp
 import discord
@@ -42,8 +43,15 @@ from discord.ext import commands, tasks
 log = logging.getLogger("weao_cog")
 
 PRIMARY_BASE = os.environ.get("WEAO_PRIMARY_BASE", "https://weao.xyz/api").rstrip("/")
-PROXY_BASE = os.environ.get("WEAO_PROXY_BASE", "http://farts.fadedis.xyz:25551/api").rstrip("/")
+MIRROR_BASES = [
+    b.strip().rstrip("/")
+    for b in os.environ.get("WEAO_MIRROR_BASES", "https://whatexpsare.online/api").split(",")
+    if b.strip()
+]
+# พอร์ตตาม README ของ DevFaded/weao-proxy-api คือ 25505
+PROXY_BASE = os.environ.get("WEAO_PROXY_BASE", "http://farts.fadedis.xyz:25505/api").rstrip("/")
 
+# เอกสาร WEAO: ต้องใช้ User-Agent "WEAO-3PService" เท่านั้น
 HEADERS = {"User-Agent": "WEAO-3PService", "Accept": "application/json"}
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "weao_notify_config.json")
@@ -53,14 +61,22 @@ REQUEST_TIMEOUT_SECONDS = 10
 
 CACHE_TTL_STATUS = 30      # วินาที
 CACHE_TTL_VERSIONS = 120
-DEFAULT_BLOCK_SECONDS = 60  # พัก primary เมื่อล้มเหลวโดยไม่รู้เวลา
+DEFAULT_BLOCK_SECONDS = 60  # พัก source เมื่อล้มเหลวโดยไม่รู้เวลา
 MAX_BLOCK_SECONDS = 300
+
+EMBED_TOTAL_LIMIT = 5500   # Discord: รวมทุก embed ในข้อความเดียวไม่เกิน 6000 ตัวอักษร
+EMBED_DESC_LIMIT = 3800    # เผื่อไว้จาก 4096
 
 NO_MENTIONS = discord.AllowedMentions.none()
 
 # ---------- helpers ----------
 
-STATE_ORDER = {"Updated & Undetected": 0, "Updated but Detected": 1, "Outdated": 2}
+# ค่า extype ในเอกสาร: wexecutor / wexternal / mexecutor (เอกสารเขียนคอลัมน์ว่า "type" แต่ตัวอย่างจริงคือ "extype")
+EXTYPE_LABELS = {
+    "wexecutor": "Windows Executor",
+    "wexternal": "Windows External",
+    "mexecutor": "Mac Executor",
+}
 
 
 def exploit_state_label(item: dict) -> str:
@@ -108,13 +124,13 @@ def safe_link(url: Any) -> str | None:
 
 def parse_retry_after(headers: Any, body: Any) -> float | None:
     """
-    ดึงเวลารอ (หน่วย: วินาที) จาก 429 response
+    ดึงเวลารอ (วินาที) จาก 429 response
 
     ลำดับความสำคัญ:
       1. header Retry-After (มาตรฐาน หน่วยวินาที)
       2. body.rateLimitInfo.remainingTime
-    เอกสาร WEAO ไม่ได้ระบุหน่วยของ remainingTime ชัดเจน จึงใช้ heuristic:
-      ค่า >= 1000 ถือว่าเป็นมิลลิวินาที (รอเป็นพันวินาที = 16+ นาที ไม่สมเหตุสมผลกับ limiter รายนาที)
+         (ตัวอย่างในเอกสาร = 120 คู่กับ resetTime เป็น epoch ms → remainingTime เป็นวินาที;
+          เอกสารไม่ได้ระบุหน่วยตรง ๆ จึงเผื่อ: ค่า >= 1000 ถือว่าเป็นมิลลิวินาที)
     ผลลัพธ์ถูก clamp ไว้ที่ 1..MAX_BLOCK_SECONDS
     """
     seconds: float | None = None
@@ -141,16 +157,108 @@ def parse_retry_after(headers: Any, body: Any) -> float | None:
     return min(max(seconds, 1.0), float(MAX_BLOCK_SECONDS))
 
 
+def item_key(item: dict) -> str:
+    """
+    คีย์ไม่ซ้ำของ exploit — บาง exploit อยู่หลายแพลตฟอร์มด้วยชื่อเดียวกัน
+    ถ้าใช้แค่ title สถานะจะทับกันและแจ้งเตือนผิด
+    """
+    title = str(item.get("title", "")).strip()
+    platform = str(item.get("platform", "")).strip()
+    return f"{title} ({platform})" if platform else title
+
+
+def visible_items(data: Any) -> list[dict]:
+    """ตัวที่มี title และไม่ถูกซ่อน (field `hidden` = ซ่อนบนหน้าเว็บ WEAO)"""
+    if not isinstance(data, list):
+        return []
+    return [i for i in data if isinstance(i, dict) and i.get("title") and not i.get("hidden")]
+
+
+def status_line(item: dict) -> str:
+    """แสดงสถานะอัปเดตแยกจากสถานะ detected (detected = ถูก Hyperion ตรวจจับ)"""
+    if not item.get("updateStatus"):
+        return "❌ Outdated"
+    if item.get("detected"):
+        return "✅ Updated · ⚠️ Detected"
+    return "✅ Updated · 🛡️ Undetected"
+
+
+def extype_label(item: dict) -> str | None:
+    raw = item.get("extype") or item.get("type")
+    if not raw:
+        return None
+    return EXTYPE_LABELS.get(str(raw).lower(), clean(raw, 50))
+
+
+def score_text(item: dict) -> str | None:
+    parts = []
+    if isinstance(item.get("suncPercentage"), (int, float)):
+        parts.append(f"sUNC {item['suncPercentage']:g}%")
+    if isinstance(item.get("uncPercentage"), (int, float)):
+        parts.append(f"UNC {item['uncPercentage']:g}%")
+    return " · ".join(parts) or None
+
+
+def feature_text(item: dict) -> str | None:
+    flags = (
+        ("decompiler", "Decompiler"),
+        ("multiInject", "Multi-Inject"),
+        ("raknet", "RakNet"),
+        ("keysystem", "Key System"),
+        ("clientmods", "Bypasses client-mod bans"),
+        ("beta", "Beta"),
+    )
+    on = [label for key, label in flags if item.get(key) is True]
+    return ", ".join(on) or None
+
+
 def proxy_supports(path: str) -> bool:
-    """พร็อกซีมีแค่ versions/current, versions/future และ status/exploits"""
-    return not path.startswith("/versions/past")
+    """พร็อกซีมีแค่ versions/current, versions/future และ status/exploits[/name]"""
+    return not path.startswith("/versions/past") and not path.startswith("/status/exploits/changelogs")
+
+
+def build_description_embeds(
+    title: str, lines: list[str], color: discord.Color, first_description: str | None = None
+) -> list[discord.Embed]:
+    """แบ่งบรรทัดลง embed ตาม limit ของ description"""
+    embeds: list[discord.Embed] = []
+    buf: list[str] = []
+    size = 0
+    for line in lines:
+        if buf and size + len(line) + 1 > EMBED_DESC_LIMIT:
+            embeds.append(discord.Embed(title=title if not embeds else f"{title} (ต่อ)",
+                                        description="\n".join(buf), color=color))
+            buf, size = [], 0
+        buf.append(line)
+        size += len(line) + 1
+    if buf:
+        embeds.append(discord.Embed(title=title if not embeds else f"{title} (ต่อ)",
+                                    description="\n".join(buf), color=color))
+    if first_description and embeds:
+        embeds[0].description = f"{first_description}\n\n{embeds[0].description}"
+    return embeds
+
+
+def chunk_embeds(embeds: list[discord.Embed]) -> Iterator[list[discord.Embed]]:
+    """แบ่ง embed เป็นหลายข้อความ ให้ไม่เกิน 10 embed และไม่เกิน ~6000 ตัวอักษรต่อข้อความ"""
+    batch: list[discord.Embed] = []
+    total = 0
+    for e in embeds:
+        n = len(e)
+        if batch and (len(batch) >= 10 or total + n > EMBED_TOTAL_LIMIT):
+            yield batch
+            batch, total = [], 0
+        batch.append(e)
+        total += n
+    if batch:
+        yield batch
 
 
 @dataclass
 class FetchResult:
     data: Any = None
     error: str | None = None
-    source: str = "primary"  # "primary" | "proxy"
+    source: str = "primary"  # "primary" | "mirror" | "proxy"
 
     @property
     def ok(self) -> bool:
@@ -158,7 +266,11 @@ class FetchResult:
 
 
 def source_footer(result: FetchResult) -> str | None:
-    return "ข้อมูลจากพร็อกซีสำรอง (fallback)" if result.source == "proxy" else None
+    if result.source == "proxy":
+        return "ข้อมูลจากพร็อกซีสำรอง (fallback)"
+    if result.source == "mirror":
+        return "ข้อมูลจากโดเมนสำรองของ WEAO (fallback)"
+    return None
 
 
 # ---------- cog ----------
@@ -169,12 +281,13 @@ class WeaoCog(commands.Cog):
         self.session: aiohttp.ClientSession | None = None
         self.notify_channels: dict[str, int] = self._load_config()
 
-        self.last_state: dict[str, str] = {}
+        self.last_state: dict[str, str] = {}   # key = item_key(item)
+        self.known_titles: set[str] = set()    # ชื่อล้วน ๆ สำหรับ autocomplete / resolve
         self._seeded = False
         self._poll_fail_streak = 0
 
         self._cache: dict[str, tuple[float, Any, str]] = {}
-        self._primary_blocked_until = 0.0
+        self._blocked_until: dict[str, float] = {}  # key = base URL
 
     async def cog_load(self):
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
@@ -244,16 +357,27 @@ class WeaoCog(commands.Cog):
                     return None, "Upstream ตอบกลับมาอ่านไม่ได้", "retry", None
 
                 if isinstance(data, dict) and data.get("error"):
+                    # 429 ที่ห่อมาใน body สถานะ 200 (ถ้ามี) ให้ถือเป็น retry
+                    if isinstance(data.get("rateLimitInfo"), dict):
+                        wait = parse_retry_after(None, data)
+                        return None, "โดน rate limit", "retry", wait
                     return None, clean(data["error"], 200), "fatal", None
 
                 return data, None, None, None
         except aiohttp.ClientError as e:
             return None, f"Network error: {type(e).__name__}", "retry", None
-        except TimeoutError:
+        except asyncio.TimeoutError:  # 3.10: ไม่ใช่ builtin TimeoutError
             return None, "หมดเวลารอ upstream", "retry", None
         except Exception as e:  # noqa: BLE001
             log.exception("Unexpected error fetching %s%s", base, path)
             return None, f"Unexpected error: {type(e).__name__}", "retry", None
+
+    def _sources_for(self, path: str) -> list[tuple[str, str]]:
+        sources: list[tuple[str, str]] = [("primary", PRIMARY_BASE)]
+        sources += [("mirror", b) for b in MIRROR_BASES if b != PRIMARY_BASE]
+        if PROXY_BASE and proxy_supports(path):
+            sources.append(("proxy", PROXY_BASE))
+        return sources
 
     async def _get(self, path: str, ttl: int = CACHE_TTL_STATUS) -> FetchResult:
         now = time.monotonic()
@@ -262,30 +386,26 @@ class WeaoCog(commands.Cog):
         if cached and cached[0] > now:
             return FetchResult(data=cached[1], source=cached[2])
 
-        sources: list[tuple[str, str]] = []
-        if now >= self._primary_blocked_until:
-            sources.append(("primary", PRIMARY_BASE))
-        if PROXY_BASE and proxy_supports(path):
-            sources.append(("proxy", PROXY_BASE))
+        all_sources = self._sources_for(path)
+        sources = [s for s in all_sources if now >= self._blocked_until.get(s[1], 0.0)]
         if not sources:
-            # primary ถูกพักอยู่และพร็อกซีไม่รองรับ path นี้ → ลอง primary ต่อดีกว่าไม่ทำอะไร
-            sources.append(("primary", PRIMARY_BASE))
+            # ทุก source ถูกพักอยู่ → ลอง primary ต่อดีกว่าไม่ทำอะไร
+            sources = [all_sources[0]]
 
         last_error = "ไม่มี source ที่ใช้งานได้"
-        for name, base in sources:
+        for kind_name, base in sources:
             data, err, kind, retry_after = await self._request(base, path)
 
             if kind is None:
-                self._cache[path] = (time.monotonic() + ttl, data, name)
-                if name == "primary":
-                    self._primary_blocked_until = 0.0
-                return FetchResult(data=data, source=name)
+                self._cache[path] = (time.monotonic() + ttl, data, kind_name)
+                self._blocked_until.pop(base, None)
+                return FetchResult(data=data, source=kind_name)
 
             last_error = err or last_error
-            if name == "primary" and kind == "retry":
+            if kind == "retry":
                 block = min(retry_after or DEFAULT_BLOCK_SECONDS, MAX_BLOCK_SECONDS)
-                self._primary_blocked_until = time.monotonic() + max(block, 5)
-                log.info("primary WEAO blocked for %.0fs (%s)", block, last_error)
+                self._blocked_until[base] = time.monotonic() + max(block, 5)
+                log.info("WEAO source %s blocked for %.0fs (%s)", base, block, last_error)
             if kind == "fatal":
                 break
 
@@ -299,14 +419,14 @@ class WeaoCog(commands.Cog):
     def _resolve_name(self, name: str) -> str:
         """จับคู่ชื่อแบบไม่สนตัวพิมพ์ใหญ่เล็กกับรายการที่รู้จัก"""
         lowered = name.strip().lower()
-        for known in self.last_state:
+        for known in self.known_titles:
             if known.lower() == lowered:
                 return known
         return name.strip()
 
     async def _exploit_autocomplete(self, interaction: discord.Interaction, current: str):
         current = current.lower()
-        names = sorted(self.last_state, key=str.lower)
+        names = sorted(self.known_titles, key=str.lower)
         return [
             app_commands.Choice(name=n[:100], value=n[:100])
             for n in names
@@ -323,49 +443,47 @@ class WeaoCog(commands.Cog):
             await interaction.followup.send(f"Couldn't fetch exploit list: {result.error}")
             return
 
-        data = result.data
-        if not isinstance(data, list) or not data:
+        items = visible_items(result.data)
+        if not items:
             await interaction.followup.send("No exploit data available right now.")
             return
 
-        items = [i for i in data if isinstance(i, dict)]
+        self.known_titles.update(str(i["title"]) for i in items)
+
+        # จัดกลุ่มตามแพลตฟอร์ม
+        groups: dict[str, list[dict]] = {}
         for i in items:
-            i["_label"] = exploit_state_label(i)
-            if i.get("title"):
-                self.last_state.setdefault(str(i["title"]), i["_label"])
-        items.sort(key=lambda i: (STATE_ORDER.get(i["_label"], 9), str(i.get("title", "")).lower()))
+            groups.setdefault(clean(i.get("platform"), 50, "Other"), []).append(i)
 
-        counts = {label: sum(1 for i in items if i["_label"] == label) for label in STATE_ORDER}
-        summary = " · ".join(f"{exploit_state_emoji(k)} {v}" for k, v in counts.items())
+        def sort_key(i: dict):
+            return (0 if i.get("updateStatus") else 1, str(i.get("title", "")).lower())
 
-        max_items = 100
-        shown = items[:max_items]
+        total_updated = sum(1 for i in items if i.get("updateStatus"))
+        total_detected = sum(1 for i in items if i.get("updateStatus") and i.get("detected"))
+        summary = (
+            f"✅ Updated {total_updated}/{len(items)} · "
+            f"⚠️ Detected {total_detected} · ❌ Outdated {len(items) - total_updated}\n"
+            "🟢 Undetected · 🟠 Detected · 🔴 Outdated"
+        )
+
         embeds: list[discord.Embed] = []
-        for start in range(0, len(shown), 25):  # embed จำกัด 25 fields
-            chunk = shown[start:start + 25]
-            embed = discord.Embed(
-                title="Exploit Status" if start == 0 else None,
-                description=summary if start == 0 else None,
-                color=discord.Color.blurple(),
+        for platform in sorted(groups):
+            lines = []
+            for item in sorted(groups[platform], key=sort_key):
+                emoji = exploit_state_emoji(exploit_state_label(item))
+                cost = "Free" if item.get("free") else "Paid"
+                lines.append(f"{emoji} **{clean(item.get('title'), 60, 'Unknown')}** · "
+                             f"{clean(item.get('version'), 30)} · {cost}")
+            embeds += build_description_embeds(
+                f"Exploit Status — {platform}", lines, discord.Color.blurple(),
+                first_description=summary if not embeds else None,
             )
-            for item in chunk:
-                free_tag = "Free" if item.get("free") else "Paid"
-                embed.add_field(
-                    name=clean(item.get("title"), 100, "Unknown"),
-                    value=f"{exploit_state_emoji(item['_label'])} {item['_label']} · {free_tag}",
-                    inline=True,
-                )
-            embeds.append(embed)
 
-        footer_parts = []
-        if len(items) > max_items:
-            footer_parts.append(f"แสดง {max_items} จาก {len(items)} รายการ")
         if (f := source_footer(result)):
-            footer_parts.append(f)
-        if footer_parts:
-            embeds[-1].set_footer(text=" · ".join(footer_parts))
+            embeds[-1].set_footer(text=f)
 
-        await interaction.followup.send(embeds=embeds, allowed_mentions=NO_MENTIONS)
+        for batch in chunk_embeds(embeds):
+            await interaction.followup.send(embeds=batch, allowed_mentions=NO_MENTIONS)
 
     # ---------- /exploit <name> ----------
 
@@ -393,27 +511,40 @@ class WeaoCog(commands.Cog):
             return
 
         label = exploit_state_label(data)
-        emoji = exploit_state_emoji(label)
 
         embed = discord.Embed(
             title=clean(data.get("title", resolved), 250),
             color=exploit_state_color(label),
         )
-        embed.add_field(name="Status", value=f"{emoji} {label}", inline=True)
+        embed.add_field(name="Status", value=status_line(data), inline=True)
         embed.add_field(name="Version", value=clean(data.get("version")), inline=True)
-        embed.add_field(name="Platform", value=clean(data.get("platform")), inline=True)
+        embed.add_field(name="Roblox Version", value=clean(data.get("rbxversion")), inline=True)
+
+        platform = clean(data.get("platform"))
+        kind = extype_label(data)
+        embed.add_field(name="Platform", value=f"{platform} · {kind}" if kind else platform, inline=True)
         embed.add_field(
             name="Cost",
             value=clean(data.get("cost") or ("Free" if data.get("free") else "Paid")),
             inline=True,
         )
         embed.add_field(name="UNC Support", value="Yes" if data.get("uncStatus") else "No", inline=True)
+
+        if (scores := score_text(data)):
+            embed.add_field(name="Scores", value=scores, inline=True)
+        if (features := feature_text(data)):
+            embed.add_field(name="Features", value=clean(features, 300), inline=True)
         embed.add_field(name="Last Updated", value=clean(data.get("updatedDate")), inline=True)
 
+        links = []
         if (site := safe_link(data.get("websitelink"))):
-            embed.add_field(name="Website", value=site, inline=False)
+            links.append(f"[Website]({site})")
+        if (disc := safe_link(data.get("discordlink"))):
+            links.append(f"[Discord]({disc})")
         if not data.get("free") and (buy := safe_link(data.get("purchaselink"))):
-            embed.add_field(name="Purchase", value=buy, inline=False)
+            links.append(f"[Purchase]({buy})")
+        if links:
+            embed.add_field(name="Links", value=" · ".join(links), inline=False)
 
         if (f := source_footer(result)):
             embed.set_footer(text=f)
@@ -423,7 +554,7 @@ class WeaoCog(commands.Cog):
     # ---------- /version <which> ----------
 
     @app_commands.command(name="version", description="Get Roblox version info")
-    @app_commands.describe(which="current, past (เฉพาะเมื่อ weao.xyz ใช้ได้) หรือ future")
+    @app_commands.describe(which="current, past (Windows/Mac เท่านั้น) หรือ future (Windows/Mac เท่านั้น)")
     @app_commands.choices(which=[
         app_commands.Choice(name="current", value="current"),
         app_commands.Choice(name="past", value="past"),
@@ -451,7 +582,7 @@ class WeaoCog(commands.Cog):
             color=discord.Color.blurple(),
         )
         found_any = False
-        # Android/iOS มีเฉพาะ endpoint "current" ตามเอกสาร
+        # Android/iOS มีเฉพาะ endpoint "current" ตามเอกสาร; past/future มีแค่ Windows/Mac
         for platform, ver_key, date_key in (
             ("Windows", "Windows", "WindowsDate"),
             ("Mac", "Mac", "MacDate"),
@@ -564,40 +695,30 @@ class WeaoCog(commands.Cog):
             return
 
         self._poll_fail_streak = 0
+        items = visible_items(result.data)
         current_state: dict[str, str] = {}
         changes: list[tuple[str, str, str]] = []
 
-        for item in result.data:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("title")
-            if not name:
-                continue
-            name = str(name)
+        for item in items:
+            name = item_key(item)
             label = exploit_state_label(item)
             current_state[name] = label
             if self._seeded and name in self.last_state and self.last_state[name] != label:
                 changes.append((name, self.last_state[name], label))
 
         self.last_state = current_state
+        self.known_titles = {str(i["title"]) for i in items}
         self._seeded = True  # poll แรกแค่ seed ไม่แจ้งเตือน
 
         if not changes or not self.notify_channels:
             return
 
-        embeds: list[discord.Embed] = []
-        for start in range(0, len(changes), 25):
-            embed = discord.Embed(
-                title="Exploit Status Changes" if start == 0 else None,
-                color=discord.Color.orange(),
-            )
-            for name, old_label, new_label in changes[start:start + 25]:
-                embed.add_field(
-                    name=clean(name, 100),
-                    value=f"{old_label} → {exploit_state_emoji(new_label)} {new_label}",
-                    inline=False,
-                )
-            embeds.append(embed)
+        lines = [
+            f"**{clean(name, 100)}**: {exploit_state_emoji(old)} {old} → {exploit_state_emoji(new)} {new}"
+            for name, old, new in changes
+        ]
+        embeds = build_description_embeds("Exploit Status Changes", lines, discord.Color.orange())
+        batches = list(chunk_embeds(embeds))
 
         stale_guilds: list[str] = []
         for guild_id, channel_id in list(self.notify_channels.items()):
@@ -608,7 +729,8 @@ class WeaoCog(commands.Cog):
             if channel is None or not hasattr(channel, "send"):
                 continue
             try:
-                await channel.send(embeds=embeds, allowed_mentions=NO_MENTIONS)
+                for batch in batches:
+                    await channel.send(embeds=batch, allowed_mentions=NO_MENTIONS)
             except discord.Forbidden:
                 log.warning("Missing permission to send in channel %s (guild %s)", channel_id, guild_id)
             except discord.HTTPException as e:
